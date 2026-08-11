@@ -10,7 +10,7 @@ class OrderApplication : Application(), DefaultLifecycleObserver {
         private set
 
     override fun onCreate() {
-        super<Application>.onCreate()
+        super.onCreate()
         container = AppContainer(this)
         ProcessLifecycleOwner.get().lifecycle.addObserver(this)
     }
