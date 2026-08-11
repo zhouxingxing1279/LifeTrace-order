@@ -17,7 +17,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,8 +28,14 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
 private const val NORMAL_REFRESH_INTERVAL_MS = 5 * 60_000L
-private const val DEFAULT_REALTIME_INTERVAL_MS = 15_000L
+private const val REALTIME_REFRESH_INTERVAL_MS = 15_000L
 private const val DAY_MS = 24 * 60 * 60_000L
+
+private data class RealtimeTarget(
+    val platform: PlatformId,
+    val accountId: String,
+    val orderIds: Set<String>,
+)
 
 data class SyncUiState(
     val foreground: Boolean = false,
@@ -48,40 +54,47 @@ class OrderSyncManager(
     private val scope = CoroutineScope(SupervisorJob() + dispatcher)
     private val refreshMutex = Mutex()
     private val backfillJobs = ConcurrentHashMap<String, Job>()
-    private val realtimeTracker = RealtimeDeliveryTracker()
-    private var foregroundJob: Job? = null
+    private val realtimeTargets = ConcurrentHashMap<String, RealtimeTarget>()
+    private var normalRefreshJob: Job? = null
+    private var realtimeRefreshJob: Job? = null
 
     private val _state = MutableStateFlow(SyncUiState())
     val state: StateFlow<SyncUiState> = _state.asStateFlow()
 
     fun onForeground() {
-        if (foregroundJob?.isActive == true) return
+        if (normalRefreshJob?.isActive == true) return
         _state.value = _state.value.copy(foreground = true, lastMessage = "进入前台，立即刷新")
-        foregroundJob = scope.launch {
+
+        normalRefreshJob = scope.launch {
+            refreshAllConnectedAccounts()
             while (isActive) {
+                delay(NORMAL_REFRESH_INTERVAL_MS)
                 refreshAllConnectedAccounts()
-                val delayMs = if (realtimeTracker.current().enabled) {
-                    realtimeTracker.current().intervalMs
-                } else {
-                    NORMAL_REFRESH_INTERVAL_MS
-                }
-                delay(delayMs)
+            }
+        }
+
+        realtimeRefreshJob = scope.launch {
+            while (isActive) {
+                delay(REALTIME_REFRESH_INTERVAL_MS)
+                refreshRealtimeTargets()
             }
         }
     }
 
     fun onBackground() {
+        normalRefreshJob?.cancel()
+        normalRefreshJob = null
+        realtimeRefreshJob?.cancel()
+        realtimeRefreshJob = null
+        realtimeTargets.clear()
+        backfillJobs.values.forEach { it.cancel() }
+        backfillJobs.clear()
         _state.value = _state.value.copy(
             foreground = false,
             running = false,
             activeRealtimeDeliveries = 0,
             lastMessage = "后台：主动轮询已停止",
         )
-        foregroundJob?.cancel()
-        foregroundJob = null
-        realtimeTracker.stop()
-        backfillJobs.values.forEach { it.cancel() }
-        backfillJobs.clear()
     }
 
     fun requestImmediateRefresh(platform: PlatformId? = null) {
@@ -95,7 +108,7 @@ class OrderSyncManager(
     }
 
     fun startBackfill(platform: PlatformId, accountId: String, range: BackfillRange) {
-        val key = "${platform.wireValue}:$accountId"
+        val key = accountKey(platform, accountId)
         if (backfillJobs[key]?.isActive == true) return
         backfillJobs[key] = scope.launch {
             try {
@@ -107,31 +120,46 @@ class OrderSyncManager(
     }
 
     fun cancelBackfill(platform: PlatformId, accountId: String) {
-        backfillJobs.remove("${platform.wireValue}:$accountId")?.cancel()
+        backfillJobs.remove(accountKey(platform, accountId))?.cancel()
     }
 
     private suspend fun refreshAllConnectedAccounts() {
         refreshMutex.withLock {
             val accounts = repository.getConnectedAccounts()
+            val connectedKeys = accounts.mapNotNull { account ->
+                platformFrom(account.platform)?.let { accountKey(it, account.accountId) }
+            }.toSet()
+            realtimeTargets.keys.removeAll { it !in connectedKeys }
+
             if (accounts.isEmpty()) {
+                updateRealtimeCount()
                 _state.value = _state.value.copy(running = false, lastMessage = "尚未连接购物平台")
                 return
             }
+
             _state.value = _state.value.copy(running = true, lastMessage = "正在刷新 ${accounts.size} 个平台账户")
-            val activeDeliveries = mutableSetOf<String>()
+            var successfulAccounts = 0
             accounts.forEach { account ->
                 val platform = platformFrom(account.platform) ?: return@forEach
                 val adapter = registry.get(platform)
                 runCatching { refreshAccount(adapter, account) }
-                    .onSuccess { activeDeliveries += it }
+                    .onSuccess { activeDeliveryIds ->
+                        successfulAccounts += 1
+                        setRealtimeTarget(platform, account.accountId, activeDeliveryIds)
+                    }
                     .onFailure { recordFailure(adapter, account, it) }
             }
-            realtimeTracker.update(activeDeliveries)
+
+            val realtimeCount = realtimeOrderCount()
             _state.value = _state.value.copy(
                 running = false,
-                activeRealtimeDeliveries = activeDeliveries.size,
-                lastSuccessAtEpochMs = if (activeDeliveries.isNotEmpty() || accounts.isNotEmpty()) now() else _state.value.lastSuccessAtEpochMs,
-                lastMessage = if (activeDeliveries.isEmpty()) "前台增量刷新完成" else "外卖实时模式：${activeDeliveries.size} 个活跃订单",
+                activeRealtimeDeliveries = realtimeCount,
+                lastSuccessAtEpochMs = if (successfulAccounts > 0) now() else _state.value.lastSuccessAtEpochMs,
+                lastMessage = when {
+                    successfulAccounts == 0 -> _state.value.lastMessage
+                    realtimeCount == 0 -> "前台增量刷新完成"
+                    else -> "外卖实时模式：$realtimeCount 个活跃订单"
+                },
             )
         }
     }
@@ -142,8 +170,78 @@ class OrderSyncManager(
             accounts.forEach { account ->
                 val adapter = registry.get(platform)
                 runCatching { refreshAccount(adapter, account) }
+                    .onSuccess { activeDeliveryIds ->
+                        setRealtimeTarget(platform, account.accountId, activeDeliveryIds)
+                        _state.value = _state.value.copy(
+                            lastSuccessAtEpochMs = now(),
+                            activeRealtimeDeliveries = realtimeOrderCount(),
+                        )
+                    }
                     .onFailure { recordFailure(adapter, account, it) }
             }
+        }
+    }
+
+    private suspend fun refreshRealtimeTargets() {
+        if (!_state.value.foreground || realtimeTargets.isEmpty()) return
+
+        refreshMutex.withLock {
+            val accounts = repository.getConnectedAccounts().associateBy { account ->
+                val platform = platformFrom(account.platform)
+                if (platform == null) account.platform else accountKey(platform, account.accountId)
+            }
+            val targets = realtimeTargets.values.toList()
+            var successfulTargets = 0
+
+            targets.forEach { target ->
+                val key = accountKey(target.platform, target.accountId)
+                val account = accounts[key]
+                if (account == null) {
+                    realtimeTargets.remove(key)
+                    return@forEach
+                }
+
+                val adapter = registry.get(target.platform)
+                runCatching {
+                    when (adapter.checkAuth(account)) {
+                        AuthState.AUTH_REQUIRED -> throw PlatformFailure(
+                            PlatformErrorCode.AUTH_REQUIRED,
+                            "${adapter.spec.displayName} 需要重新登录",
+                        )
+                        AuthState.VERIFICATION_REQUIRED -> throw PlatformFailure(
+                            PlatformErrorCode.VERIFICATION_REQUIRED,
+                            "${adapter.spec.displayName} 需要用户完成安全验证",
+                        )
+                        AuthState.AUTHENTICATED, AuthState.UNKNOWN -> Unit
+                    }
+                    adapter.fetchActiveDeliveries(account).map { adapter.normalize(account, it) }
+                }.onSuccess { activeDeliveries ->
+                    successfulTargets += 1
+                    repository.upsertOrders(activeDeliveries)
+                    setRealtimeTarget(target.platform, target.accountId, activeDeliveries.map { it.platformOrderId }.toSet())
+                }.onFailure { error ->
+                    val failure = recordFailure(adapter, account, error)
+                    if (failure.code in setOf(
+                            PlatformErrorCode.AUTH_REQUIRED,
+                            PlatformErrorCode.VERIFICATION_REQUIRED,
+                            PlatformErrorCode.RATE_LIMITED,
+                        )
+                    ) {
+                        realtimeTargets.remove(key)
+                    }
+                }
+            }
+
+            val realtimeCount = realtimeOrderCount()
+            _state.value = _state.value.copy(
+                activeRealtimeDeliveries = realtimeCount,
+                lastSuccessAtEpochMs = if (successfulTargets > 0) now() else _state.value.lastSuccessAtEpochMs,
+                lastMessage = when {
+                    successfulTargets == 0 -> _state.value.lastMessage
+                    realtimeCount == 0 -> "外卖实时追踪已结束"
+                    else -> "外卖实时模式：$realtimeCount 个活跃订单"
+                },
+            )
         }
     }
 
@@ -151,7 +249,7 @@ class OrderSyncManager(
         adapter: PlatformAdapter,
         account: PlatformAccountEntity,
     ): Set<String> {
-        when (val auth = adapter.checkAuth(account)) {
+        when (adapter.checkAuth(account)) {
             AuthState.AUTH_REQUIRED -> throw PlatformFailure(PlatformErrorCode.AUTH_REQUIRED, "${adapter.spec.displayName} 需要重新登录")
             AuthState.VERIFICATION_REQUIRED -> throw PlatformFailure(PlatformErrorCode.VERIFICATION_REQUIRED, "${adapter.spec.displayName} 需要用户完成安全验证")
             AuthState.AUTHENTICATED, AuthState.UNKNOWN -> Unit
@@ -161,13 +259,13 @@ class OrderSyncManager(
         val overlapDays = oldState?.overlapDays ?: 14
         val rangeStart = now() - overlapDays * DAY_MS
         val page = adapter.fetchOrderPage(account, cursor = null, rangeStartEpochMs = rangeStart)
-        val normalized = page.orders.map { adapter.normalize(account, it) }
-        repository.upsertOrders(normalized)
+        repository.upsertOrders(page.orders.map { adapter.normalize(account, it) })
 
         val activeOrderIds = repository.getActiveOrderIds(adapter.spec.id, account.accountId)
         if (activeOrderIds.isNotEmpty()) {
-            val refreshed = adapter.refreshOrders(account, activeOrderIds).map { adapter.normalize(account, it) }
-            repository.upsertOrders(refreshed)
+            repository.upsertOrders(
+                adapter.refreshOrders(account, activeOrderIds).map { adapter.normalize(account, it) },
+            )
         }
 
         val activeDeliveries = adapter.fetchActiveDeliveries(account).map { adapter.normalize(account, it) }
@@ -196,7 +294,7 @@ class OrderSyncManager(
             ?: ShoppingSyncStateEntity(platform.wireValue, accountId)
         var cursor = state.initialCursor
 
-        while (scope.isActive && _state.value.foreground) {
+        while (currentCoroutineContext().isActive && _state.value.foreground) {
             val page = adapter.fetchOrderPage(account, cursor, rangeStart)
             repository.upsertOrders(page.orders.map { adapter.normalize(account, it) })
             cursor = page.nextCursor
@@ -214,7 +312,11 @@ class OrderSyncManager(
             )
             repository.saveSyncState(state)
             _state.value = _state.value.copy(
-                lastMessage = if (complete) "${adapter.spec.displayName} 历史回填完成" else "${adapter.spec.displayName} 历史回填继续：cursor=${cursor ?: "end"}",
+                lastMessage = if (complete) {
+                    "${adapter.spec.displayName} 历史回填完成"
+                } else {
+                    "${adapter.spec.displayName} 历史回填继续：cursor=${cursor ?: "end"}"
+                },
             )
             if (complete) break
         }
@@ -224,7 +326,7 @@ class OrderSyncManager(
         adapter: PlatformAdapter,
         account: PlatformAccountEntity,
         error: Throwable,
-    ) {
+    ): PlatformFailure {
         if (error is CancellationException) throw error
         val failure = adapter.classifyError(error)
         val old = repository.getSyncState(adapter.spec.id, account.accountId)
@@ -237,15 +339,27 @@ class OrderSyncManager(
             ),
         )
         _state.value = _state.value.copy(running = false, lastMessage = failure.message)
-        if (failure.code in setOf(
-                PlatformErrorCode.AUTH_REQUIRED,
-                PlatformErrorCode.VERIFICATION_REQUIRED,
-                PlatformErrorCode.RATE_LIMITED,
-            )
-        ) {
-            realtimeTracker.stop()
-        }
+        return failure
     }
+
+    private fun setRealtimeTarget(platform: PlatformId, accountId: String, orderIds: Set<String>) {
+        val key = accountKey(platform, accountId)
+        if (orderIds.isEmpty()) {
+            realtimeTargets.remove(key)
+        } else {
+            realtimeTargets[key] = RealtimeTarget(platform, accountId, orderIds)
+        }
+        updateRealtimeCount()
+    }
+
+    private fun updateRealtimeCount() {
+        _state.value = _state.value.copy(activeRealtimeDeliveries = realtimeOrderCount())
+    }
+
+    private fun realtimeOrderCount(): Int = realtimeTargets.values.sumOf { it.orderIds.size }
+
+    private fun accountKey(platform: PlatformId, accountId: String): String =
+        "${platform.wireValue}:$accountId"
 
     private fun platformFrom(value: String): PlatformId? =
         PlatformId.entries.firstOrNull { it.wireValue == value }
