@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -35,7 +36,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.lifetrace.order.AppContainer
 import com.lifetrace.order.data.entity.PlatformAccountEntity
-import com.lifetrace.order.domain.PlatformId
 import com.lifetrace.order.domain.UnifiedOrder
 import com.lifetrace.order.platform.AuthState
 import com.lifetrace.order.platform.BackfillRange
@@ -46,6 +46,7 @@ import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun OrderApp(container: AppContainer) {
     val orders by container.repository.observeRecentOrders().collectAsState(initial = emptyList())
